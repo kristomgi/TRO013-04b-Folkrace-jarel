@@ -86,3 +86,9 @@ Pärast push-i käivitub automaatne hindamine (~1-2 min).
 **Vaata tulemusi:** oma repo → **Actions** → viimane töö
 
 Hindamine otsib `folkrace_juht.py` faili **kõikidest kaustadest** ja kontrollib koodi sisu (lidar lugemine, kiiruse reguleerimine, pööramiseloogika).
+
+---
+
+## Küsimused ja lisainfo
+
+Kui midagi on ebaselge või vajad täiendavat selgitust, vaata Moodle kursuse **Moodul 04: Lidar-põhine iseseisev sõitmine** peatükki — seal on üksikasjalikud juhised, näidiskood ja selgitused.
