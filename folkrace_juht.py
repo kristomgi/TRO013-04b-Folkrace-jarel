@@ -6,42 +6,73 @@ import statistics
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 
 
-SOIDUKIIRUS = 0.30
-AEGLANE_KIIRUS = 0.16
-VAGA_AEGLANE_KIIRUS = 0.08
-
-POORDEKIIRUS = 0.9
-
-OHUPIIR_ETTE = 0.55
-OHUPIIR_KULG = 0.28
-
-
 class FolkraceJuht(Node):
+    MAX_KIIRUS = 0.35
+    MIN_KIIRUS = 0.10
+    MAX_POORDEKIIRUS = 1.0
+
+    OHUTU_KAUGUS = 1.0
+    KRIITILINE_KAUGUS = 0.35
+    KULG_OHUPIIR = 0.25
+
+    RINGIDE_ARV = 3
+    RINGI_PIKKUS = 5.0
+
     def __init__(self):
         super().__init__('folkrace_juht')
 
-        self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.sub = self.create_subscription(
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        self.scan_sub = self.create_subscription(
             LaserScan,
             '/scan',
-            self._scan_cb,
+            self.scan_callback,
             10
         )
 
-        self.viimane_olek = "ootan lidar andmeid"
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            '/odom',
+            self.odom_callback,
+            10
+        )
 
-    def _olek(self, tekst):
-        self.viimane_olek = tekst
-        self.get_logger().info(tekst)
+        self.praegune_x = 0.0
+        self.praegune_y = 0.0
+        self.prev_x = None
+        self.prev_y = None
+
+        self.kogu_labitud = 0.0
+        self.labitud_ringid = 0
+
+        self.get_logger().info('Folkrace juht kaivitatud')
+
+    def odom_callback(self, msg):
+        self.praegune_x = msg.pose.pose.position.x
+        self.praegune_y = msg.pose.pose.position.y
+
+        if self.prev_x is not None:
+            dx = self.praegune_x - self.prev_x
+            dy = self.praegune_y - self.prev_y
+            self.kogu_labitud += math.sqrt(dx * dx + dy * dy)
+
+            if self.kogu_labitud >= self.RINGI_PIKKUS * (self.labitud_ringid + 1):
+                self.labitud_ringid += 1
+                self.get_logger().info(
+                    f'Ring {self.labitud_ringid}/{self.RINGIDE_ARV} labitud'
+                )
+
+        self.prev_x = self.praegune_x
+        self.prev_y = self.praegune_y
+
+    def _piira(self, value, min_value, max_value):
+        return max(min_value, min(value, max_value))
 
     def _sektori_min(self, ranges, nurk_min, nurk_max, default=8.0):
-        """
-        Leiab sektori kauguse lidarist.
-        0 kraadi = ette, +90 = vasak, -90 = parem.
-        """
         n = len(ranges)
         if n == 0:
             return default
@@ -49,7 +80,6 @@ class FolkraceJuht(Node):
         values = []
 
         for kraad in range(nurk_min, nurk_max + 1):
-            # LaserScan: -180 kraadi on index 0, 0 kraadi on index 360
             index = int((kraad + 180) / 360 * n) % n
             r = ranges[index]
 
@@ -59,10 +89,13 @@ class FolkraceJuht(Node):
         if len(values) == 0:
             return default
 
-        # Mediaan teeb lugemise stabiilsemaks kui yksik min vaartus
         return statistics.median(values)
 
-    def _scan_cb(self, msg):
+    def scan_callback(self, msg):
+        if self.labitud_ringid >= self.RINGIDE_ARV:
+            self._peata()
+            return
+
         ranges = msg.ranges
 
         ette = self._sektori_min(ranges, -20, 20)
@@ -82,67 +115,61 @@ class FolkraceJuht(Node):
         cmd = Twist()
         cmd.linear.x = kiirus
         cmd.angular.z = poore
-
-        self.pub.publish(cmd)
+        self.cmd_pub.publish(cmd)
 
     def _arvuta_kiirus(self, ette, ette_vasak, ette_parem, vasak, parem):
-        """
-        Lidaripohine reaktiivne juhtimine.
-
-        Tagastab:
-        kiirus - linear.x
-        poore  - angular.z
-        """
-
-        # Arvesta ka diagonaalseid sektoreid, et robot aeglustaks enne kurvi.
         ohu_kaugus = min(ette, ette_vasak * 0.85, ette_parem * 0.85)
 
-        # Kiiruse reguleerimine:
-        # kaugel = kiire, lahedal = aeglane
-        if ohu_kaugus > 1.2:
-            kiirus = SOIDUKIIRUS
-        elif ohu_kaugus > OHUPIIR_ETTE:
-            kiirus = AEGLANE_KIIRUS
+        if ohu_kaugus > self.OHUTU_KAUGUS:
+            kiirus = self.MAX_KIIRUS
+        elif ohu_kaugus > self.KRIITILINE_KAUGUS:
+            ratio = (
+                (ohu_kaugus - self.KRIITILINE_KAUGUS)
+                / (self.OHUTU_KAUGUS - self.KRIITILINE_KAUGUS)
+            )
+            kiirus = self.MIN_KIIRUS + ratio * (self.MAX_KIIRUS - self.MIN_KIIRUS)
         else:
-            kiirus = VAGA_AEGLANE_KIIRUS
+            kiirus = 0.0
 
-        # Raja keskel hoidmine.
-        # Kui vasakul on rohkem ruumi kui paremal, poora vasakule.
-        # Kui paremal on rohkem ruumi kui vasakul, poora paremale.
         kylje_viga = vasak - parem
-        poore = 0.45 * kylje_viga
+        poore = kylje_viga * 0.45
 
-        # Kui ees voi diagonaalis on sein lahedal, poora tugevamalt sinna,
-        # kus ruumi rohkem on.
-        if ette < OHUPIIR_ETTE or ette_vasak < 0.45 or ette_parem < 0.45:
-            if ette_vasak > ette_parem:
-                poore = POORDEKIIRUS
-                self._olek("sein ees, pooran vasakule")
+        if ette < self.KRIITILINE_KAUGUS:
+            if vasak > parem:
+                poore = self.MAX_POORDEKIIRUS
             else:
-                poore = -POORDEKIIRUS
-                self._olek("sein ees, pooran paremale")
-        else:
-            self._olek("soidan ja hoian rada keskel")
+                poore = -self.MAX_POORDEKIIRUS
+            kiirus = 0.0
 
-        # Kylgseina kaitse.
-        if vasak < OHUPIIR_KULG:
-            poore = -POORDEKIIRUS
-            kiirus = min(kiirus, AEGLANE_KIIRUS)
+        elif ette_vasak < 0.45 or ette_parem < 0.45:
+            if ette_vasak > ette_parem:
+                poore += 0.45
+            else:
+                poore -= 0.45
+            kiirus = min(kiirus, 0.18)
 
-        if parem < OHUPIIR_KULG:
-            poore = POORDEKIIRUS
-            kiirus = min(kiirus, AEGLANE_KIIRUS)
+        if vasak < self.KULG_OHUPIIR:
+            poore = -self.MAX_POORDEKIIRUS
+            kiirus = min(kiirus, 0.15)
 
-        # Piira poore, et robot ei pendeldaks liiga palju.
-        poore = max(-POORDEKIIRUS, min(POORDEKIIRUS, poore))
+        if parem < self.KULG_OHUPIIR:
+            poore = self.MAX_POORDEKIIRUS
+            kiirus = min(kiirus, 0.15)
+
+        # Silla/kitsa koha korral hoia kiirus madalam ja poore sujuvam.
+        if vasak < 0.55 and parem < 0.55 and ette > 0.6:
+            kiirus = min(kiirus, 0.16)
+            poore = self._piira(poore, -0.45, 0.45)
+
+        poore = self._piira(poore, -self.MAX_POORDEKIIRUS, self.MAX_POORDEKIIRUS)
 
         return kiirus, poore
 
-    def peata(self):
+    def _peata(self):
         cmd = Twist()
         cmd.linear.x = 0.0
         cmd.angular.z = 0.0
-        self.pub.publish(cmd)
+        self.cmd_pub.publish(cmd)
 
 
 def main(args=None):
@@ -154,7 +181,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
 
-    node.peata()
+    node._peata()
     node.destroy_node()
     rclpy.shutdown()
 
